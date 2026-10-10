@@ -1,0 +1,172 @@
+import numpy as np
+import pandas as pd
+from statsmodels.tsa.seasonal import STL
+
+# =====================================================================
+# STEP 0: LOAD YOUR DATA
+# =====================================================================
+# raw_df = pd.read_csv('traffic_data.csv')
+
+# Ensure proper data types
+raw_df['session_start_dt'] = pd.to_datetime(raw_df['session_start_dt'])
+raw_df['marketing_vehicle'] = raw_df['marketing_vehicle'].astype(str)
+raw_df['device'] = raw_df['device'].astype(str)
+raw_df['visites'] = pd.to_numeric(raw_df['visites'], errors='coerce').fillna(0)
+
+# Create the combo identifier
+raw_df['combo'] = raw_df['marketing_vehicle'] + ' - ' + raw_df['device']
+
+# =====================================================================
+# STEP 1: DEFINE RUN DATES (09-Sep-2026 Target, train up to 08-Sep-2026)
+# =====================================================================
+target_eval_date = pd.to_datetime('2026-09-09')
+history_cutoff_date = target_eval_date - pd.Timedelta(days=1)  # 2026-09-08
+max_lookback_days = 730
+
+# =====================================================================
+# STEP 2: LOOP OVER EVERY COMBO & RUN DETECTION LOGIC
+# =====================================================================
+results_list = []
+unique_combos = raw_df['combo'].unique()
+
+for combo_name in unique_combos:
+  combo_df = raw_df[raw_df['combo'] == combo_name].copy()
+  combo_df = combo_df.sort_values('session_start_dt').set_index(
+      'session_start_dt'
+  )
+
+  # Check if target date (09 Sep 2026) exists for this combo
+  if target_eval_date not in combo_df.index:
+    continue
+
+  actual_today = float(combo_df.loc[target_eval_date, 'visites'])
+
+  # Determine dynamic start date: earliest date available, capped at 730 days
+  historical_dates = combo_df.index[combo_df.index <= history_cutoff_date]
+  if len(historical_dates) == 0:
+    continue
+
+  combo_earliest_date = historical_dates.min()
+  cap_earliest_date = target_eval_date - pd.Timedelta(days=max_lookback_days)
+  combo_start_date = max(combo_earliest_date, cap_earliest_date)
+
+  # Extract training slice strictly <= 08 Sep 2026 and >= dynamic start date
+  train_mask = (combo_df.index >= combo_start_date) & (
+      combo_df.index <= history_cutoff_date
+  )
+  train_ts = combo_df.loc[train_mask, 'visites']
+
+  # Ensure calendar continuity for STL (fill missing days with 0)
+  train_date_idx = pd.date_range(
+      start=combo_start_date, end=history_cutoff_date, freq='D'
+  )
+  train_ts = train_ts.reindex(train_date_idx, fill_value=0.0)
+
+  train_len = len(train_ts)
+  if train_len == 0:
+    continue
+
+  # -----------------------------------------------------------------
+  # STEP 2A: Statistical Decomposition Logic (Log-STL vs Cold-Start)
+  # -----------------------------------------------------------------
+  target_dow = target_eval_date.dayofweek  # 0=Monday, 6=Sunday
+
+  if train_len < 30:
+    # Cold-Start Pipeline (< 30 days history)
+    same_dow_history = train_ts[train_ts.index.dayofweek == target_dow]
+    if len(same_dow_history) < 2:
+      same_dow_history = train_ts.tail(min(train_len, 7))
+
+    q25 = float(np.percentile(same_dow_history, 25))
+    q75 = float(np.percentile(same_dow_history, 75))
+    expected_val = float(np.median(same_dow_history))
+    iqr = q75 - q25
+
+    effective_spread = iqr if iqr > 0 else (0.1 * expected_val + 1.0)
+    final_lower = max(0.0, q25 - (1.5 * effective_spread))
+    final_upper = q75 + (1.5 * effective_spread)
+
+  else:
+    # Growing & Mature Pipeline (30 to 730 days)
+    trend_win = 15 if train_len < 365 else 25
+    z_crit = 2.80 if train_len < 365 else 2.58
+
+    # 1. Transform to log space
+    train_log = np.log1p(train_ts)
+
+    # 2. Fit Robust STL (7-day periodic wave)
+    stl_fit = STL(train_log, period=7, trend=trend_win, robust=True).fit()
+
+    # 3. Project Trend for target date (smoothed slope over last 3 days)
+    last_trend = stl_fit.trend.iloc[-1]
+    if len(stl_fit.trend) >= 4:
+      smoothed_slope = (last_trend - stl_fit.trend.iloc[-4]) / 3.0
+    else:
+      smoothed_slope = 0.0
+    projected_trend = last_trend + smoothed_slope
+
+    # 4. Project Day-of-Week Seasonality (7 days prior matching day-of-week)
+    projected_seasonal = stl_fit.seasonal.iloc[-7]
+    expected_log_val = projected_trend + projected_seasonal
+    expected_val = float(np.expm1(expected_log_val))
+
+    # 5. Robust Variance via MAD (last 60 residuals)
+    eval_win = min(train_len, 60)
+    residuals_sample = stl_fit.resid.iloc[-eval_win:]
+    med_res = float(np.median(residuals_sample))
+    mad = float(np.median(np.abs(residuals_sample - med_res)))
+    sigma_log = (mad * 1.4826) if mad > 0 else 0.02
+
+    # 6. Compute Statistical Bounds in Log Space and Invert to Raw Visits
+    lower_log = expected_log_val - (z_crit * sigma_log)
+    upper_log = expected_log_val + (z_crit * sigma_log)
+
+    final_lower = max(0.0, float(np.expm1(lower_log)))
+    final_upper = float(np.expm1(upper_log))
+
+  # -----------------------------------------------------------------
+  # STEP 2B: Evaluate Anomaly Status
+  # -----------------------------------------------------------------
+  is_anomaly = False
+  status = 'NORMAL'
+
+  if actual_today < final_lower:
+    is_anomaly = True
+    status = 'ANOMALY_DROP'
+  elif actual_today > final_upper:
+    is_anomaly = True
+    status = 'ANOMALY_SPIKE'
+
+  mv_name = str(combo_df['marketing_vehicle'].iloc[0])
+  dev_name = str(combo_df['device'].iloc[0])
+
+  results_list.append({
+      'daterun': target_eval_date.strftime('%d/%m/%Y'),
+      'combo': combo_name,
+      'marketing_vehicle': mv_name,
+      'device': dev_name,
+      'actual_traffic': int(actual_today),
+      'expected_traffic': int(round(expected_val)),
+      'lower_bound': int(round(final_lower)),
+      'upper_bound': int(round(final_upper)),
+      'status': status,
+      'is_anomaly': is_anomaly,
+  })
+
+# =====================================================================
+# STEP 3: CONSOLIDATE & DISPLAY TARGET FORMAT
+# =====================================================================
+anomaly_results_df = pd.DataFrame(results_list)
+
+output_df = anomaly_results_df[[
+    'daterun',
+    'actual_traffic',
+    'combo',
+    'expected_traffic',
+    'lower_bound',
+    'upper_bound',
+    'status',
+    'is_anomaly',
+]]
+
+print(output_df.to_string(index=False))
