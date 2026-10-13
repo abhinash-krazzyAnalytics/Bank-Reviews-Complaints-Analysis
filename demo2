@@ -1,0 +1,430 @@
+sample case
+WITH raw_combos AS (
+
+    SELECT 
+
+        DATE(session_start_dt) AS session_start_dt,
+
+        CONCAT(marketing_vehicle, '__', device) AS combo_id,
+
+        marketing_vehicle,
+
+        device,
+
+        traffic
+
+    FROM `your_project.your_dataset.traffic_table`
+
+),
+
+
+
+-- 1. Gather Recent 10 Matching Weekdays (t - 7k) into an Array
+
+recent_window AS (
+
+    SELECT 
+
+        curr.session_start_dt,
+
+        curr.combo_id,
+
+        curr.marketing_vehicle,
+
+        curr.device,
+
+        curr.traffic AS actual_traffic,
+
+        ARRAY_AGG(past.traffic) AS recent_vals
+
+    FROM raw_combos curr
+
+    JOIN raw_combos past
+
+      ON curr.combo_id = past.combo_id
+
+     AND past.session_start_dt IN (
+
+         DATE_SUB(curr.session_start_dt, INTERVAL 7 DAY),
+
+         DATE_SUB(curr.session_start_dt, INTERVAL 14 DAY),
+
+         DATE_SUB(curr.session_start_dt, INTERVAL 21 DAY),
+
+         DATE_SUB(curr.session_start_dt, INTERVAL 28 DAY),
+
+         DATE_SUB(curr.session_start_dt, INTERVAL 35 DAY),
+
+         DATE_SUB(curr.session_start_dt, INTERVAL 42 DAY),
+
+         DATE_SUB(curr.session_start_dt, INTERVAL 49 DAY),
+
+         DATE_SUB(curr.session_start_dt, INTERVAL 56 DAY),
+
+         DATE_SUB(curr.session_start_dt, INTERVAL 63 DAY),
+
+         DATE_SUB(curr.session_start_dt, INTERVAL 70 DAY)
+
+     )
+
+    GROUP BY curr.session_start_dt, curr.combo_id, curr.marketing_vehicle, curr.device, curr.traffic
+
+    HAVING ARRAY_LENGTH(recent_vals) >= 5
+
+),
+
+
+
+-- 2. Compute Recent Baseline Median (mu_recent) and Scaled MAD (sigma_raw)
+
+recent_stats AS (
+
+    SELECT 
+
+        session_start_dt,
+
+        combo_id,
+
+        marketing_vehicle,
+
+        device,
+
+        actual_traffic,
+
+        
+
+        -- Median of recent 10 matching weekdays
+
+        (SELECT APPROX_QUANTILES(v, 100)[OFFSET(50)] FROM UNNEST(recent_vals) v) AS mu_recent,
+
+        
+
+        -- Scaled MAD = 1.4826 * Median(|v - mu_recent|)
+
+        1.4826 * (
+
+            SELECT APPROX_QUANTILES(
+
+                ABS(v - (SELECT APPROX_QUANTILES(x, 100)[OFFSET(50)] FROM UNNEST(recent_vals) x)), 
+
+                100
+
+            )[OFFSET(50)]
+
+            FROM UNNEST(recent_vals) v
+
+        ) AS sigma_raw
+
+    FROM recent_window
+
+),
+
+
+
+-- 3. Prior Year 5-Week Centered Target Window (t - 364 +/- 14d)
+
+ly_target_window AS (
+
+    SELECT 
+
+        curr.session_start_dt,
+
+        curr.combo_id,
+
+        APPROX_QUANTILES(past.traffic, 100)[OFFSET(50)] AS mu_ly_target
+
+    FROM raw_combos curr
+
+    JOIN raw_combos past
+
+      ON curr.combo_id = past.combo_id
+
+     AND past.session_start_dt IN (
+
+         DATE_SUB(curr.session_start_dt, INTERVAL 350 DAY),
+
+         DATE_SUB(curr.session_start_dt, INTERVAL 357 DAY),
+
+         DATE_SUB(curr.session_start_dt, INTERVAL 364 DAY),
+
+         DATE_SUB(curr.session_start_dt, INTERVAL 371 DAY),
+
+         DATE_SUB(curr.session_start_dt, INTERVAL 378 DAY)
+
+     )
+
+    GROUP BY curr.session_start_dt, curr.combo_id
+
+    HAVING COUNT(past.traffic) >= 3
+
+),
+
+
+
+-- 4. Prior Year 10-Week Trailing Base Window (t - 364 - 7k)
+
+ly_base_window AS (
+
+    SELECT 
+
+        curr.session_start_dt,
+
+        curr.combo_id,
+
+        APPROX_QUANTILES(past.traffic, 100)[OFFSET(50)] AS mu_ly_base
+
+    FROM raw_combos curr
+
+    JOIN raw_combos past
+
+      ON curr.combo_id = past.combo_id
+
+     AND past.session_start_dt IN (
+
+         DATE_SUB(curr.session_start_dt, INTERVAL 371 DAY),
+
+         DATE_SUB(curr.session_start_dt, INTERVAL 378 DAY),
+
+         DATE_SUB(curr.session_start_dt, INTERVAL 385 DAY),
+
+         DATE_SUB(curr.session_start_dt, INTERVAL 392 DAY),
+
+         DATE_SUB(curr.session_start_dt, INTERVAL 399 DAY),
+
+         DATE_SUB(curr.session_start_dt, INTERVAL 406 DAY),
+
+         DATE_SUB(curr.session_start_dt, INTERVAL 413 DAY),
+
+         DATE_SUB(curr.session_start_dt, INTERVAL 420 DAY),
+
+         DATE_SUB(curr.session_start_dt, INTERVAL 427 DAY),
+
+         DATE_SUB(curr.session_start_dt, INTERVAL 434 DAY)
+
+     )
+
+    GROUP BY curr.session_start_dt, curr.combo_id
+
+    HAVING COUNT(past.traffic) >= 5
+
+),
+
+
+
+-- 5. Calculate YoY Growth and Expected Baseline (y_hat)
+
+combined_baselines AS (
+
+    SELECT 
+
+        r.session_start_dt,
+
+        r.combo_id,
+
+        r.marketing_vehicle,
+
+        r.device,
+
+        r.actual_traffic,
+
+        r.mu_recent,
+
+        r.sigma_raw,
+
+        t.mu_ly_target,
+
+        b.mu_ly_base,
+
+        
+
+        -- Clamped secular YoY growth: [-30%, +50%]
+
+        CASE 
+
+            WHEN b.mu_ly_base IS NOT NULL AND b.mu_ly_base > 0 
+
+                THEN LEAST(0.50, GREATEST(-0.30, (r.mu_recent - b.mu_ly_base) / b.mu_ly_base))
+
+            ELSE 0.0 
+
+        END AS g_safe,
+
+        
+
+        -- Fallback: if combo has < 378 days of history, use mu_recent directly
+
+        CASE 
+
+            WHEN t.mu_ly_target IS NOT NULL AND b.mu_ly_base IS NOT NULL AND b.mu_ly_base > 0 
+
+                THEN t.mu_ly_target * (1 + LEAST(0.50, GREATEST(-0.30, (r.mu_recent - b.mu_ly_base) / b.mu_ly_base)))
+
+            ELSE r.mu_recent
+
+        END AS expected_traffic
+
+    FROM recent_stats r
+
+    LEFT JOIN ly_target_window t
+
+      ON r.session_start_dt = t.session_start_dt AND r.combo_id = t.combo_id
+
+    LEFT JOIN ly_base_window b
+
+      ON r.session_start_dt = b.session_start_dt AND r.combo_id = b.combo_id
+
+),
+
+
+
+-- 6. Dynamic Tier Assignment (10K to 90M Scale)
+
+tiered_parameters AS (
+
+    SELECT 
+
+        *,
+
+        -- Volatility Floor
+
+        CASE 
+
+            WHEN expected_traffic >= 20000000 THEN 0.02  -- 50M, 90M (Tier 1)
+
+            WHEN expected_traffic >= 1000000  THEN 0.04  -- 10M (Tier 2)
+
+            WHEN expected_traffic >= 100000   THEN 0.08  -- 0.3M / 300K (Tier 3)
+
+            ELSE 0.12                                    -- 10K, 50K (Tier 4)
+
+        END AS floor_pct,
+
+        
+
+        -- Multiplier k
+
+        CASE 
+
+            WHEN expected_traffic < 100000 THEN 4.0
+
+            ELSE 3.5 
+
+        END AS k_sigma,
+
+        
+
+        -- Practical Business Delta Gate
+
+        CASE 
+
+            WHEN expected_traffic >= 20000000 THEN 0.05  -- +/- 5%
+
+            WHEN expected_traffic >= 1000000  THEN 0.08  -- +/- 8%
+
+            WHEN expected_traffic >= 100000   THEN 0.15  -- +/- 15%
+
+            ELSE 0.20                                    -- +/- 20%
+
+        END AS delta_pct
+
+    FROM combined_baselines
+
+),
+
+
+
+-- 7. Compute Boundaries and Two-Factor Anomaly Gates
+
+final_scoring AS (
+
+    SELECT 
+
+        session_start_dt,
+
+        combo_id,
+
+        marketing_vehicle,
+
+        device,
+
+        actual_traffic,
+
+        ROUND(expected_traffic, 0) AS expected_traffic,
+
+        ROUND(g_safe, 4) AS yoy_growth_applied,
+
+        
+
+        -- Enforce Dispersion Floor
+
+        ROUND(GREATEST(sigma_raw, floor_pct * expected_traffic), 2) AS sigma_stable,
+
+        
+
+        -- Boundaries
+
+        ROUND(expected_traffic + (k_sigma * GREATEST(sigma_raw, floor_pct * expected_traffic)), 0) AS upper_threshold,
+
+        ROUND(GREATEST(0.0, expected_traffic - (k_sigma * GREATEST(sigma_raw, floor_pct * expected_traffic))), 0) AS lower_threshold,
+
+        
+
+        -- Delta Gate Bounds
+
+        ROUND(expected_traffic * (1 + delta_pct), 0) AS min_spike_volume,
+
+        ROUND(expected_traffic * (1 - delta_pct), 0) AS max_drop_volume
+
+    FROM tiered_parameters
+
+)
+
+
+
+SELECT 
+
+    session_start_dt,
+
+    combo_id,
+
+    marketing_vehicle,
+
+    device,
+
+    actual_traffic,
+
+    expected_traffic,
+
+    upper_threshold,
+
+    lower_threshold,
+
+    
+
+    -- Two-Gate Spike Trigger
+
+    (actual_traffic > upper_threshold AND actual_traffic > min_spike_volume) AS is_spike,
+
+    
+
+    -- Two-Gate Drop Trigger (with zero-traffic catch for combos >= 100 sessions)
+
+    ((actual_traffic < lower_threshold AND actual_traffic < max_drop_volume) 
+
+     OR (actual_traffic = 0 AND expected_traffic >= 100)) AS is_drop,
+
+     
+
+    -- Consolidated Anomaly Flag
+
+    ((actual_traffic > upper_threshold AND actual_traffic > min_spike_volume) 
+
+     OR (actual_traffic < lower_threshold AND actual_traffic < max_drop_volume) 
+
+     OR (actual_traffic = 0 AND expected_traffic >= 100)) AS is_anomaly
+
+
+
+FROM final_scoring
+
+ORDER BY session_start_dt DESC, actual_traffic DESC;
